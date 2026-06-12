@@ -20,3 +20,10 @@ void launch_batched_decode(const float* q, const float* k_cache, const float* v_
 void launch_batched_paged(const float* q, const float* k_pool, const float* v_pool,
                           const int* table_all, const int* tab_off, const int* cur_len,
                           float* out, int N, int H, int D, int BLOCK, int cap, float scale);
+
+// ---- flash decode: 在线 softmax (running max/sum) + split-K ----
+// 单序列连续布局 q[H,D] / k_cache,v_cache[H,S,D] / out[H,D]，与 launch_decode 同口径。
+// num_splits: 把长度 cur_len 的 KV 切成几段并行；段间用第二个 reduce kernel 合并。
+void launch_flash_decode(const float* q, const float* k_cache, const float* v_cache,
+                         float* out, int cur_len, int H, int D, int S, float scale,
+                         int num_splits);

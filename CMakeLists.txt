@@ -29,3 +29,7 @@ target_include_directories(bench_paged PRIVATE src/include)
 # ---- bench_throughput: 多序列变长压测 (显存 + 吞吐, paged 的真正价值) ----
 add_executable(bench_throughput src/bench_throughput.cu src/batched.cu)
 target_include_directories(bench_throughput PRIVATE src/include)
+
+# ---- flash: 在线 softmax + split-K decode 正确性测试 ----
+add_executable(flash src/main_flash.cu src/flash_decode.cu)
+target_include_directories(flash PRIVATE src/include)
