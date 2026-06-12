@@ -1,4 +1,4 @@
-# kvcache — 手写 CUDA KV cache + decode attention + PagedAttention 对比
+# kvcache — CUDA KV cache + decode attention + PagedAttention 对比
 
 从零实现 decode 阶段的 attention 与 KV cache，并复现 **PagedAttention** 的核心权衡：
 用一点单步延迟换取数倍的显存效率与并发能力。所有 kernel 手写 CUDA，CPU 端 numpy 对拍验证正确性。
@@ -75,4 +75,4 @@ python ref/plot.py                                # 出图到 data/*.png
 - **并发**：固定 4096 MB 预算，连续能放 512 条，paged 能放 **1598 条（3.1×）**。
 - **代价**：同 batch 下 paged 吞吐 = 连续的 **0.92×**（间接寻址）。
 
-**一句话结论**：paged attention 用 ~8% 单步延迟，换 3.1× 显存效率与并发上限——这正是 vLLM 把吞吐做高的关键。单序列基准（②）只看得到代价，必须上多序列变长压测（③）才看得到价值。
+**一句话结论**：paged attention 用 ~8% 单步延迟，换 3.1× 显存效率与并发上限——这是 vLLM 把吞吐做高的关键。单序列基准（②）只看得到代价，多序列变长压测（③）才看得到价值。

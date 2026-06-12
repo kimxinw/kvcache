@@ -11,6 +11,9 @@
 #include <cfloat>
 
 // D 个线程对 red[0..D) 做树形归约 (op=0 取 max, op=1 求和), 结果广播在 red[0]。
+//文中的所有d，都是线程索引
+//block_reduce中，多个线程用来求一个token的maxD和sumD
+//softmax
 __device__ inline float block_reduce(float* red, int d, int D, int op) {
     __syncthreads();
     for (int stride = D/2; stride > 0; stride >>= 1) {
@@ -46,28 +49,37 @@ __device__ inline void softmax_inplace(float* score, int L, float* red, int d, i
 __global__ void batched_decode(const float* q, const float* k_cache, const float* v_cache,
                                const int* cur_len, float* out,
                                int H, int D, int MAXS, int cap, float scale) {
-    int s = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
-    int L = cur_len[s];
+    int s = blockIdx.x, h = blockIdx.y, d = threadIdx.x;//s是batch序列索引,h是该batch下的第几个head，d是维度索引[0,D-1];
+    int L = cur_len[s];//第s批prom的序列长度（token数）
     extern __shared__ float smem[];
+    //smem 本身就是指向共享内存起始地址的指针。
     float* q_s   = smem;            // [D]
+    //q_s 指向这块内存的开头，被当作一个长度为 D 的 float 数组使用（即占用 D * sizeof(float) 字节）。
     float* score = smem + D;        // [cap]
+    //smem + D 是指针算术：跳过前 D 个 float 元素（即 q_s 占用的空间），指向接下来的位置
+    //score 被当作长度为 cap 的数组使用（占用 cap * sizeof(float) 字节）。
     float* red   = smem + D + cap;  // [D]
+    //smem + D + cap 再跳过 score 占用的 cap 个元素，指向更后面的位置。
+    //red被当做长度为 D 的数组使用（占用D * sizeof(float)字节）
 
     const float* qh = q       + ((size_t)s*H + h)*D;
-    const float* kh = k_cache + ((size_t)s*H + h)*MAXS*D;
+    const float* kh = k_cache + ((size_t)s*H + h)*MAXS*D;//MAXS是所有批次里最长的序列token个数
     const float* vh = v_cache + ((size_t)s*H + h)*MAXS*D;
     float* outh     = out     + ((size_t)s*H + h)*D;
 
     q_s[d] = qh[d];
     __syncthreads();
-
+    //这里的pos=d,对应于不同的线程，D是总的线程数，由CPU主机端调用时通过<<<H,D>>>传入
+    //pos是token的索引，就是该batch下的第几个token
     for (int pos = d; pos < L; pos += D) {           // score = q·K[pos]*scale
         float acc = 0.f;
-        for (int i = 0; i < D; ++i) acc += q_s[i] * kh[pos*D + i];
+        for (int i = 0; i < D; ++i) acc += q_s[i] * kh[pos*D + i];//kh[pos*D+i]代表第pos个token的第i维;
         score[pos] = acc * scale;
+        //此时该批次下的第pos个token的q*kT记录在acc中了，乘以scal==1/sqrt(D)后记录在score[pos]中
     }
     __syncthreads();
-
+    // 屏障：Block 内所有线程都必须到达这个位置才继续
+    // 保证共享内存可见性：一个线程写入 smem 的内容，其他线程在 __syncthreads() 之后可以安全读取
     softmax_inplace(score, L, red, d, D);            // 并行 softmax
 
     float acc = 0.f;                                 // out[d] = Σ prob[pos]*V[pos][d]
@@ -98,7 +110,7 @@ __global__ void batched_paged(const float* q, const float* k_pool, const float* 
 
     q_s[d] = qh[d];
     __syncthreads();
-
+    //D是线程数
     for (int pos = d; pos < L; pos += D) {
         const float* krow = k_pool + bp_offset(table, pos, h, H, BLOCK, D);
         float acc = 0.f;

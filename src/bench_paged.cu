@@ -12,12 +12,15 @@
 #include <vector>
 #include <cuda_runtime.h>
 
-#define CK(x) do { cudaError_t e=(x); if(e){ \
+#define CK(x) do { cudaError_t e=(x); if(e){ \ 
     printf("CUDA err %s @%s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); exit(1);} } while(0)
 
 // 简单可复现 RNG, 填 [-1,1] 区间
 static void fill_rand(std::vector<float>& v, unsigned seed) {
-    for (auto& x : v) { seed = seed*1103515245u + 12345u; x = (seed>>9)/8388608.0f*2.0f - 1.0f; }
+    for (auto& x : v) { 
+        seed = seed*1103515245u + 12345u; 
+        x = (seed>>9)/8388608.0f*2.0f - 1.0f; 
+    }
 }
 
 // 计时单个 kernel 启动 (warmup 后取平均, 返回微秒)

@@ -22,7 +22,8 @@ struct BlockAllocator {
     // 取一个物理块; 池空则返回 -1 (调用方判 OOM)
     int alloc() {
         if (free_list.empty()) return -1;
-        int b = free_list.back(); free_list.pop_back();
+        int b = free_list.back(); 
+        free_list.pop_back();
         return b;
     }
     // 归还一条序列占用的所有物理块
@@ -33,5 +34,5 @@ struct BlockAllocator {
 
 // 给定一条序列长度, 计算需要多少个物理块
 static inline int blocks_needed(int seq_len, int block) {
-    return (seq_len + block - 1) / block;
+    return (seq_len + block - 1) / block;//向上取整
 }
