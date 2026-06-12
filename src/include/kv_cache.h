@@ -9,3 +9,14 @@ void launch_recompute(const float* q,const float* k_cache,const float* v_cache,c
 void launch_paged(const float* q, const float* k_pool, const float* v_pool,
                   const int* block_table, float* out, int cur_len,
                   int H, int D, int BLOCK, float scale);
+
+// ---- 批量 (多序列) decode：grid = (N 个序列, H 个 head) ----
+// 连续布局: 每条序列预留 [H, MAXS, D]; 整块 cache = [N, H, MAXS, D]; cur_len[N] 给每条真实长度。
+void launch_batched_decode(const float* q, const float* k_cache, const float* v_cache,
+                           const int* cur_len, float* out,
+                           int N, int H, int D, int MAXS, int cap, float scale);
+// 分页布局: 共享物理池 [num_blocks, H, BLOCK, D]; 所有序列的 block_table 拼接在 table_all 里,
+//   第 s 条从 tab_off[s] 开始; cur_len[s] 给真实长度; cap = 最长序列(定 shared mem 上界)。
+void launch_batched_paged(const float* q, const float* k_pool, const float* v_pool,
+                          const int* table_all, const int* tab_off, const int* cur_len,
+                          float* out, int N, int H, int D, int BLOCK, int cap, float scale);
