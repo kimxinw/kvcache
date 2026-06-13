@@ -145,3 +145,63 @@ void launch_batched_paged(const float* q, const float* k_pool, const float* v_po
     batched_paged<<<grid, D, shmem>>>(q, k_pool, v_pool, table_all, tab_off, cur_len,
                                       out, H, D, BLOCK, cap, scale);
 }
+
+// ---------- 分页布局批量 decode · flash 风格在线 softmax (引擎权威 kernel) ----------
+// 与上面的 batched_paged 算法等价、输出一致, 区别在 softmax 的做法:
+//   batched_paged : 先把整张 score[cap] 落 shared, 再两遍并行 reduce (max -> exp+sum)。
+//   这里(flash)   : 不 materialize score —— 单遍扫 KV, 用 running (m,l,acc) 边算边 rescale,
+//                   shared 只占 2*D(q_s + red), 与序列长度 cap 无关。长序列省下 O(cap) shared,
+//                   也省掉一遍 KV 扫描。这是 ModelRunner/Engine 实际调用的那条路径。
+// GQA 友好点: 取 K/V 用的 head 是 'h'(= q 的 head); 接 GQA 时把这里换成 h / (n_q/n_kv) 的
+//   kv_head 映射、并让 grid.y = n_q_heads 即可, 池布局(n_kv_heads)与本 kernel 结构都不动。
+__global__ void batched_paged_flash(const float* q, const float* k_pool, const float* v_pool,
+                                    const int* table_all, const int* tab_off, const int* cur_len,
+                                    float* out, int H, int D, int BLOCK, float scale) {
+    int s = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    int L = cur_len[s];
+    const int* table = table_all + tab_off[s];
+    extern __shared__ float smem[];
+    float* q_s = smem;        // [D]
+    float* red = smem + D;    // [D] 点积树形 reduce 缓冲
+
+    const float* qh = q   + ((size_t)s*H + h)*D;
+    float* outh     = out + ((size_t)s*H + h)*D;
+
+    q_s[d] = qh[d];
+    __syncthreads();
+
+    // running 状态: m/l 为标量(每线程各存一份, 恒等); acc 按维度 d 分到各线程寄存器。
+    float m = -FLT_MAX, l = 0.f, acc = 0.f;
+    for (int pos = 0; pos < L; ++pos) {
+        // 1) score = (q · K_pos) * scale —— 对 D 维树形 reduce
+        const float* krow = k_pool + bp_offset(table, pos, h, H, BLOCK, D);
+        red[d] = q_s[d] * krow[d];
+        __syncthreads();
+        for (int stride = D >> 1; stride > 0; stride >>= 1) {
+            if (d < stride) red[d] += red[d + stride];
+            __syncthreads();
+        }
+        float sc = red[0] * scale;
+        __syncthreads();                      // 读完 red[0] 再进下一轮(下次要改写 red)
+        // 2) 在线更新 running max / sum / 累加器
+        const float* vrow = v_pool + bp_offset(table, pos, h, H, BLOCK, D);
+        float m_new = fmaxf(m, sc);
+        float corr  = __expf(m - m_new);      // 旧累加量缩放(首个元素 m=-FLT_MAX -> corr=0)
+        float p     = __expf(sc - m_new);     // 当前 token 权重
+        l   = l   * corr + p;
+        acc = acc * corr + p * vrow[d];
+        m   = m_new;
+    }
+    outh[d] = (l > 0.f) ? acc / l : 0.f;
+}
+
+// 与 launch_batched_paged 同签名(cap 不再需要, 仅为 drop-in 替换保留), 故 ModelRunner 换一行即可。
+void launch_batched_paged_flash(const float* q, const float* k_pool, const float* v_pool,
+                                const int* table_all, const int* tab_off, const int* cur_len,
+                                float* out, int N, int H, int D, int BLOCK, int cap, float scale) {
+    (void)cap;
+    dim3 grid(N, H);
+    size_t shmem = (size_t)2 * D * sizeof(float);   // q_s[D] + red[D], 与序列长度无关
+    batched_paged_flash<<<grid, D, shmem>>>(q, k_pool, v_pool, table_all, tab_off, cur_len,
+                                            out, H, D, BLOCK, scale);
+}

@@ -49,10 +49,15 @@ int main(){
         gmin=std::min(gmin,g); gmax=std::max(gmax,g);
     }
 
-    Engine eng(H,D,BLOCK,BATCH,pool_blocks);
+    EngineConfig cfg{ H, D, BLOCK, pool_blocks, BATCH };
+    Engine eng(cfg);                                               // 拥有共享的 KV 池 + 执行器
 
-    SchedResult cs = run_static(reqs, eng, pool_blocks, BATCH);     // reqs 按值传入, 两次互不干扰
-    SchedResult cc = run_continuous(reqs, eng, pool_blocks, BATCH);
+    // static 基线: 复用 eng 的 KVCacheManager + ModelRunner (内部 reset 后跑)。
+    EngineStats cs = run_static(reqs, eng.kvm, eng.runner, BATCH);
+    // continuous 主力: 同一套核心, 装载 trace 后跑 (Engine 即 continuous 实现)。
+    eng.reset();
+    for (const Request& r : reqs) eng.add_request(r.prompt_len, r.gen_len, r.arrival_us);
+    EngineStats cc = eng.run();
 
     // ---- 报告 ----
     printf("# config: NREQ=%d BATCH=%d H=%d D=%d BLOCK=%d  pool=%d blocks (%d MB)  arrival_rate=%.0f req/s%s\n",
@@ -60,7 +65,7 @@ int main(){
     printf("# trace: prompt mean=%.0f  gen[min=%d mean=%.0f max=%d]  total_gen_tokens=%lld\n",
            (double)prompt_total/NREQ, gmin,(double)gen_total/NREQ,gmax, gen_total);
 
-    auto row=[&](const SchedResult& R){
+    auto row=[&](const EngineStats& R){
         double wall=R.wall_us;
         printf("%-11s %7d %11.1f %9.0f %9.0f %9.1f %8.1f%% %8.1f%% %8d %9.1f %9.1f\n",
             R.name, R.iters, wall/1000.0,

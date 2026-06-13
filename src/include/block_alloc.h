@@ -30,6 +30,11 @@ struct BlockAllocator {
     void free_blocks(const std::vector<int>& blocks) {
         for (int b : blocks) free_list.push_back(b);
     }
+    // 复位: 把所有块放回 free list (基准里同一池子连跑多种策略时, 每轮开跑前调一次)。
+    void reset() {
+        free_list.clear();
+        for (int i = total_blocks - 1; i >= 0; --i) free_list.push_back(i);
+    }
 };
 
 // 给定一条序列长度, 计算需要多少个物理块

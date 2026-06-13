@@ -37,3 +37,16 @@ target_include_directories(flash PRIVATE src/include)
 # ---- continuous: continuous vs static batching 调度器对比 (吞吐 / 延迟 / slot 利用率) ----
 add_executable(continuous src/bench_continuous.cu src/batched.cu)
 target_include_directories(continuous PRIVATE src/include)
+
+# ==== 引擎框架 (Engine -> ModelRunner -> KVCacheManager -> paged kernel) ====
+# ---- demo_engine: 离线 continuous batching 端到端骨架验证 ----
+add_executable(demo_engine apps/demo_engine.cu src/batched.cu)
+target_include_directories(demo_engine PRIVATE src/include)
+
+# ---- test_kv_manager: KVCacheManager / Sequence 单元测试 ----
+add_executable(test_kv_manager tests/test_kv_manager.cu)
+target_include_directories(test_kv_manager PRIVATE src/include)
+
+# ---- test_paged_flash: 权威 flash kernel vs 两遍 softmax 输出一致性 ----
+add_executable(test_paged_flash tests/test_paged_flash.cu src/batched.cu)
+target_include_directories(test_paged_flash PRIVATE src/include)

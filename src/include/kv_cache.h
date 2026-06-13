@@ -20,6 +20,11 @@ void launch_batched_decode(const float* q, const float* k_cache, const float* v_
 void launch_batched_paged(const float* q, const float* k_pool, const float* v_pool,
                           const int* table_all, const int* tab_off, const int* cur_len,
                           float* out, int N, int H, int D, int BLOCK, int cap, float scale);
+// flash 风格在线 softmax 版 (引擎权威 kernel)。与 launch_batched_paged 同签名、输出一致,
+//   但 shared 只占 2*D(不落 score[cap])、单遍扫 KV。详见 batched.cu。
+void launch_batched_paged_flash(const float* q, const float* k_pool, const float* v_pool,
+                                const int* table_all, const int* tab_off, const int* cur_len,
+                                float* out, int N, int H, int D, int BLOCK, int cap, float scale);
 
 // ---- flash decode: 在线 softmax (running max/sum) + split-K ----
 // 单序列连续布局 q[H,D] / k_cache,v_cache[H,S,D] / out[H,D]，与 launch_decode 同口径。
