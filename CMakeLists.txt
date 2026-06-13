@@ -33,3 +33,7 @@ target_include_directories(bench_throughput PRIVATE src/include)
 # ---- flash: 在线 softmax + split-K decode 正确性测试 ----
 add_executable(flash src/main_flash.cu src/flash_decode.cu)
 target_include_directories(flash PRIVATE src/include)
+
+# ---- continuous: continuous vs static batching 调度器对比 (吞吐 / 延迟 / slot 利用率) ----
+add_executable(continuous src/bench_continuous.cu src/batched.cu)
+target_include_directories(continuous PRIVATE src/include)

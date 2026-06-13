@@ -72,7 +72,7 @@ int main() {
 
     // ---- 显存账本 ----
     double per_elem = sizeof(float);
-    double contig_reserved = (double)N*H*LMAX*D*per_elem*2;          // K+V, 每条预留 MAXS
+    double contig_reserved = (double)N*H*LMAX*D*per_elem*2;          // K+V, 所以需要*2,每条预留 MAXS
     double contig_used     = (double)sum_len*H*D*per_elem*2;         // 真实用到的行
     double paged_used      = (double)total_blocks*H*BLOCK*D*per_elem*2
                            + table_all.size()*sizeof(int);           // 池 + block_table
