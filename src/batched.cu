@@ -202,6 +202,6 @@ void launch_batched_paged_flash(const float* q, const float* k_pool, const float
     (void)cap;
     dim3 grid(N, H);
     size_t shmem = (size_t)2 * D * sizeof(float);   // q_s[D] + red[D], 与序列长度无关
-    batched_paged_flash<<<grid, D, shmem>>>(q, k_pool, v_pool, table_all, tab_off, cur_len,
+    batched_paged_flash<<<grid, D, shmem>>>(q, k_pool, v_pool, table_all, tab_off , cur_len,
                                             out, H, D, BLOCK, scale);
 }

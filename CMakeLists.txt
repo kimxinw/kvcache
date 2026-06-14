@@ -50,3 +50,15 @@ target_include_directories(test_kv_manager PRIVATE src/include)
 # ---- test_paged_flash: 权威 flash kernel vs 两遍 softmax 输出一致性 ----
 add_executable(test_paged_flash tests/test_paged_flash.cu src/batched.cu)
 target_include_directories(test_paged_flash PRIVATE src/include)
+
+# ==== 真模型: Qwen2.5-0.5B-Instruct 单序列前向 + 贪心 decode ====
+# 线性层 cuBLAS + 手写 attention/RoPE/RMSNorm/SwiGLU。
+add_executable(qwen_infer apps/qwen_infer.cu src/qwen_kernels.cu)
+target_include_directories(qwen_infer PRIVATE src/include)
+find_package(CUDAToolkit REQUIRED)
+target_link_libraries(qwen_infer PRIVATE CUDA::cublas)
+
+# ==== 里程碑2: continuous batching 多序列真生成 ====
+add_executable(qwen_serve apps/qwen_serve.cu src/qwen_kernels.cu)
+target_include_directories(qwen_serve PRIVATE src/include)
+target_link_libraries(qwen_serve PRIVATE CUDA::cublas)

@@ -21,6 +21,7 @@ __global__ void flash_split(const float* q,
                             float* part_m,     // [H, num_splits]     该段 running max
                             float* part_l,     // [H, num_splits]     该段 running sum
                             int cur_len, int D, int S, float scale, int num_splits) {
+    // 索引布局是：先按 head 分组，每个 head 下有 num_splits 个段，每个段有 D 个浮点数。
     int h     = blockIdx.x;
     int split = blockIdx.y;
     int d     = threadIdx.x;
@@ -30,7 +31,7 @@ __global__ void flash_split(const float* q,
     int j0 = split * chunk;
     int j1 = min(j0 + chunk, cur_len);
 
-    extern __shared__ float smem[];
+    extern __shared__ float smem[];//shared memory，同一block内所有线程共享
     float* q_s = smem;          // [D]  query 搬进 shared 复用
     float* red = smem + D;      // [D]  点积的树形 reduce 缓冲
 
@@ -42,11 +43,13 @@ __global__ void flash_split(const float* q,
     __syncthreads();
 
     // 在线 softmax 的 running 状态：m/l 是标量，每个线程各存一份（都从同一个 score 推出，恒等）。
-    // acc 按维度 d 分到每个线程的寄存器里。
+    // acc是定义在核函数（__global__）内的自动变量（位于寄存器），每个线程各持有一个独立副本，
+    //每个线程都能访问自己的 acc，但不同线程的 acc 是不同内存位置，互不干扰。acc 按维度 d 分到每个线程的寄存器里。
+    //acc是线程私有的累加器
     float m = -FLT_MAX, l = 0.f, acc = 0.f;
 
     for (int j = j0; j < j1; ++j) {
-        // 1) score_j = (q · K_j) * scale —— 树形 reduce over D
+        // 1) score_j = (q · K_j) * scale —— 树形 reduce over D 
         red[d] = q_s[d] * kh[j * D + d];
         __syncthreads();
         for (int stride = D >> 1; stride > 0; stride >>= 1) {
