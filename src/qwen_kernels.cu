@@ -5,19 +5,24 @@
 #include <math.h>
 
 // ---------- embedding gather: out[L,H] = embed[ids[r]] ----------
-__global__ void k_embed(float* out, const float* embed, const int* ids, int L, int H) {
+__global__ void k_embed(float* out, const float* embed, const int* ids, int L, int H,cudaStream_t stream) {
+    // int r = blockIdx.x;
+    // int tok = ids[r];
+    // const float* src = embed + (size_t)tok * H; 
+    // float* dst = out + (size_t)r * H;
+    // for (int i = threadIdx.x; i < H; i += blockDim.x) dst[i] = src[i];
     int r = blockIdx.x;
     int tok = ids[r];
     const float* src = embed + (size_t)tok * H;
     float* dst = out + (size_t)r * H;
-    for (int i = threadIdx.x; i < H; i += blockDim.x) dst[i] = src[i];
+    for(int i =threadIdx.x;i<H;i+=blockDim.x)dst[i] = src[i];
 }
-void qk_embed_gather(float* out, const float* embed, const int* ids, int L, int H) {
-    k_embed<<<L, 256>>>(out, embed, ids, L, H);
+void qk_embed_gather(float* out, const float* embed, const int* ids, int L, int H,cudaStream_t stream) {
+    k_embed<<<L, 256,0,stream>>>(out, embed, ids, L, H,stream);
 }
 
 // ---------- RMSNorm: 每行 out = x * rsqrt(mean(x^2)+eps) * w ----------
-__global__ void k_rmsnorm(float* out, const float* in, const float* w, int H, float eps) {
+__global__ void k_rmsnorm(float* out, const float* in, const float* w, int H, float eps,cudaStream_t stream) {
     int r = blockIdx.x;
     const float* x = in + (size_t)r * H;
     float* y = out + (size_t)r * H;
@@ -32,31 +37,31 @@ __global__ void k_rmsnorm(float* out, const float* in, const float* w, int H, fl
     float inv = rsqrtf(red[0] / H + eps);
     for (int i = threadIdx.x; i < H; i += blockDim.x) y[i] = x[i] * inv * w[i];
 }
-void qk_rmsnorm(float* out, const float* in, const float* w, int L, int H, float eps) {
-    k_rmsnorm<<<L, 256>>>(out, in, w, H, eps);
+void qk_rmsnorm(float* out, const float* in, const float* w, int L, int H, float eps,cudaStream_t stream) {
+    k_rmsnorm<<<L, 256,0,stream>>>(out, in, w, H, eps,stream);
 }
 
 // ---------- 行广播加 bias: x[L,N] += bias[N] ----------
-__global__ void k_add_bias(float* x, const float* bias, int L, int N) {
+__global__ void k_add_bias(float* x, const float* bias, int L, int N,cudaStream_t stream) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < L * N) x[idx] += bias[idx % N];
 }
-void qk_add_bias(float* x, const float* bias, int L, int N) {
-    int n = L * N; k_add_bias<<<(n + 255) / 256, 256>>>(x, bias, L, N);
+void qk_add_bias(float* x, const float* bias, int L, int N,cudaStream_t stream ) {
+    int n = L * N; k_add_bias<<<(n + 255) / 256, 256,0,stream>>>(x, bias, L, N,stream);
 }
 
 // ---------- 残差: x += y ----------
-__global__ void k_add(float* x, const float* y, int n) {
+__global__ void k_add(float* x, const float* y, int n,cudaStream_t stream) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];
 }
-void qk_add_residual(float* x, const float* y, int n) {
-    k_add<<<(n + 255) / 256, 256>>>(x, y, n);
+void qk_add_residual(float* x, const float* y, int n,cudaStream_t stream) {
+    k_add<<<(n + 255) / 256, 256,0,stream>>>(x, y, n,stream);
 }
 
 // ---------- RoPE (HF rotate_half 风格)。x 视作 [L*n_heads, D]，每个 (row,head) 一个 D 向量 ----------
 // 位置 pos = pos_base + row；inv_freq[t] = theta^(-2t/D)，t in [0,D/2)。
-__global__ void k_rope(float* x, int n_heads, int D, int pos_base, float theta) {
+__global__ void k_rope(float* x, int n_heads, int D, int pos_base, float theta,cudaStream_t stream) {
     int blk = blockIdx.x;            // = row*n_heads + head
     int row = blk / n_heads;
     int half = D >> 1;
@@ -70,24 +75,42 @@ __global__ void k_rope(float* x, int n_heads, int D, int pos_base, float theta) 
     base[t]        = x1 * c - x2 * s;
     base[t + half] = x2 * c + x1 * s;
 }
-void qk_rope(float* x, int L, int n_heads, int D, int pos_base, float theta) {
-    k_rope<<<L * n_heads, D / 2>>>(x, n_heads, D, pos_base, theta);
+void qk_rope(float* x, int L, int n_heads, int D, int pos_base, float theta,cudaStream_t stream) {
+    k_rope<<<L * n_heads, D / 2,0,stream>>>(x, n_heads, D, pos_base, theta,stream);
+}
+
+__global__ void kcuda_rope(float* x, int n_heads, int D, int* pos_base, float theta,cudaStream_t stream) {
+    int blk = blockIdx.x;            // = row*n_heads + head
+    int row = blk / n_heads;
+    int half = D >> 1;
+    int t = threadIdx.x;             // [0, half)
+    float* base = x + (size_t)blk * D;
+    float pos = (float)(*pos_base + row);
+    float inv = __expf(-logf(theta) * (2.0f * t / D));
+    float ang = pos * inv;
+    float c = cosf(ang), s = sinf(ang);
+    float x1 = base[t], x2 = base[t + half];
+    base[t]        = x1 * c - x2 * s;
+    base[t + half] = x2 * c + x1 * s;
+}
+void qkcuda_rope(float* x, int L, int n_heads, int D, int* pos_base, float theta,cudaStream_t stream) {
+    kcuda_rope<<<L * n_heads, D / 2,0,stream>>>(x, n_heads, D, pos_base, theta,stream);
 }
 
 // ---------- SwiGLU: out = silu(gate) * up ----------
-__global__ void k_silu_mul(float* out, const float* gate, const float* up, int n) {
+__global__ void k_silu_mul(float* out, const float* gate, const float* up, int n,cudaStream_t stream) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { float g = gate[i]; out[i] = (g / (1.f + __expf(-g))) * up[i]; }
 }
-void qk_silu_mul(float* out, const float* gate, const float* up, int n) {
-    k_silu_mul<<<(n + 255) / 256, 256>>>(out, gate, up, n);
+void qk_silu_mul(float* out, const float* gate, const float* up, int n,cudaStream_t stream) {
+    k_silu_mul<<<(n + 255) / 256, 256,0,stream>>>(out, gate, up, n,stream);
 }
 
 // ---------- 写 K/V 入分页池 [num_blocks, Hkv, BLOCK, D] ----------
 __global__ void k_write_kv(const float* k, const float* v, float* k_pool, float* v_pool,
-                           const int* bt, int start_pos, int Hkv, int D, int BLOCK) {
+                           const int* bt, int start_pos, int Hkv, int D, int BLOCK,cudaStream_t stream) {
     int blk = blockIdx.x;            // = r*Hkv + hk
-    int r = blk / Hkv, hk = blk % Hkv;
+    int r = blk / Hkv, hk = blk % Hkv;//此处的线性关系看CPU调用核函数的签名L*Hkv
     int pos = start_pos + r;
     int phys = bt[pos / BLOCK], in = pos % BLOCK;
     size_t dst = (((size_t)phys * Hkv + hk) * BLOCK + in) * D;
@@ -97,16 +120,33 @@ __global__ void k_write_kv(const float* k, const float* v, float* k_pool, float*
     v_pool[dst + d] = v[src + d];
 }
 void qk_write_kv(const float* k, const float* v, float* k_pool, float* v_pool,
-                 const int* block_table_dev, int start_pos, int L, int Hkv, int D, int BLOCK) {
-    k_write_kv<<<L * Hkv, D>>>(k, v, k_pool, v_pool, block_table_dev, start_pos, Hkv, D, BLOCK);
+                 const int* block_table_dev, int start_pos, int L, int Hkv, int D, int BLOCK,cudaStream_t stream) {
+    k_write_kv<<<L * Hkv, D,0,stream>>>(k, v, k_pool, v_pool, block_table_dev, start_pos, Hkv, D, BLOCK,stream);
+}
+
+__global__ void kcuda_write_kv(const float* k, const float* v, float* k_pool, float* v_pool,
+                           const int* bt, int* start_pos, int Hkv, int D, int BLOCK,cudaStream_t stream) {
+    int blk = blockIdx.x;            // = r*Hkv + hk
+    int r = blk / Hkv, hk = blk % Hkv;//此处的线性关系看CPU调用核函数的签名L*Hkv
+    int pos = *start_pos + r;
+    int phys = bt[pos / BLOCK], in = pos % BLOCK;
+    size_t dst = (((size_t)phys * Hkv + hk) * BLOCK + in) * D;
+    size_t src = (size_t)blk * D;
+    int d = threadIdx.x;
+    k_pool[dst + d] = k[src + d];
+    v_pool[dst + d] = v[src + d];
+}
+void qkcuda_write_kv(const float* k, const float* v, float* k_pool, float* v_pool,
+                 const int* block_table_dev, int* start_pos, int L, int Hkv, int D, int BLOCK,cudaStream_t stream) {
+    kcuda_write_kv<<<L * Hkv, D,0,stream>>>(k, v, k_pool, v_pool, block_table_dev, start_pos, Hkv, D, BLOCK,stream);
 }
 
 // ---------- GQA 因果分页 attention，flash 在线 softmax ----------
 __global__ void k_paged_attn(const float* q, float* out, const float* k_pool, const float* v_pool,
-                             const int* bt, int q_pos_base, int Hq, int Hkv, int D, int BLOCK, float scale) {
+                             const int* bt, int q_pos_base, int Hq, int Hkv, int D, int BLOCK, float scale,cudaStream_t stream) {
     int qi = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
-    int kv_head = h / (Hq / Hkv);
-    int Lc = q_pos_base + qi + 1;            // 因果长度
+    int kv_head = h / (Hq / Hkv);            //GQA/MQA核心：Hq/Hkv个query共享一个kv head
+    int Lc = q_pos_base + qi + 1;            // 因果长度，当前query能看到多少个token(include itself)
     extern __shared__ float smem[];
     float* q_s = smem;                       // [D]
     float* red = smem + D;                   // [D]
@@ -117,14 +157,14 @@ __global__ void k_paged_attn(const float* q, float* out, const float* k_pool, co
 
     float m = -FLT_MAX, l = 0.f, acc = 0.f;
     for (int pos = 0; pos < Lc; ++pos) {
-        int phys = bt[pos / BLOCK], in = pos % BLOCK;
+        int phys = bt[pos / BLOCK], in = pos % BLOCK;//虚拟快、物理块一个块都有BLOCK个token
         size_t off = (((size_t)phys * Hkv + kv_head) * BLOCK + in) * D;
-        red[d] = q_s[d] * k_pool[off + d];
+        red[d] = q_s[d] * k_pool[off + d];//k+pool[num_blocks, Hkv, BLOCK, D]
         __syncthreads();
         for (int s = D >> 1; s > 0; s >>= 1) { if (d < s) red[d] += red[d + s]; __syncthreads(); }
         float sc = red[0] * scale;
         __syncthreads();
-        float vd = v_pool[off + d];
+        float vd = v_pool[off + d];//k_pool、v_pool本质上都是一维数组
         float m_new = fmaxf(m, sc);
         float corr = __expf(m - m_new);
         float p = __expf(sc - m_new);
@@ -136,15 +176,56 @@ __global__ void k_paged_attn(const float* q, float* out, const float* k_pool, co
 }
 void qk_paged_causal_attn(const float* q, float* out, const float* k_pool, const float* v_pool,
                           const int* block_table_dev, int q_pos_base,
-                          int Nq, int Hq, int Hkv, int D, int BLOCK, float scale) {
+                          int Nq, int Hq, int Hkv, int D, int BLOCK, float scale,cudaStream_t stream) {
     dim3 grid(Nq, Hq);
     size_t shmem = (size_t)2 * D * sizeof(float);
-    k_paged_attn<<<grid, D, shmem>>>(q, out, k_pool, v_pool, block_table_dev, q_pos_base,
-                                     Hq, Hkv, D, BLOCK, scale);
+    k_paged_attn<<<grid, D, shmem,stream>>>(q, out, k_pool, v_pool, block_table_dev, q_pos_base,
+                                     Hq, Hkv, D, BLOCK, scale,stream);
+}
+
+__global__ void kcuda_paged_attn(const float* q, float* out, const float* k_pool, const float* v_pool,
+                             const int* bt, int* q_pos_base, int Hq, int Hkv, int D, int BLOCK, float scale,cudaStream_t stream) {
+    int qi = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    int kv_head = h / (Hq / Hkv);            //GQA/MQA核心：Hq/Hkv个query共享一个kv head
+    int Lc = *q_pos_base + qi + 1;            // 因果长度，当前query能看到多少个token(include itself)
+    extern __shared__ float smem[];
+    float* q_s = smem;                       // [D]
+    float* red = smem + D;                   // [D]
+    const float* qh = q + ((size_t)qi * Hq + h) * D;
+    float* outh    = out + ((size_t)qi * Hq + h) * D;
+    q_s[d] = qh[d];
+    __syncthreads();
+
+    float m = -FLT_MAX, l = 0.f, acc = 0.f;
+    for (int pos = 0; pos < Lc; ++pos) {
+        int phys = bt[pos / BLOCK], in = pos % BLOCK;//虚拟快、物理块一个块都有BLOCK个token
+        size_t off = (((size_t)phys * Hkv + kv_head) * BLOCK + in) * D;
+        red[d] = q_s[d] * k_pool[off + d];//k+pool[num_blocks, Hkv, BLOCK, D]
+        __syncthreads();
+        for (int s = D >> 1; s > 0; s >>= 1) { if (d < s) red[d] += red[d + s]; __syncthreads(); }
+        float sc = red[0] * scale;
+        __syncthreads();
+        float vd = v_pool[off + d];//k_pool、v_pool本质上都是一维数组
+        float m_new = fmaxf(m, sc);
+        float corr = __expf(m - m_new);
+        float p = __expf(sc - m_new);
+        l = l * corr + p;
+        acc = acc * corr + p * vd;
+        m = m_new;
+    }
+    outh[d] = (l > 0.f) ? acc / l : 0.f;
+}
+void qkcuda_paged_causal_attn(const float* q, float* out, const float* k_pool, const float* v_pool,
+                          const int* block_table_dev, int* q_pos_base,
+                          int Nq, int Hq, int Hkv, int D, int BLOCK, float scale,cudaStream_t stream) {
+    dim3 grid(Nq, Hq);
+    size_t shmem = (size_t)2 * D * sizeof(float);
+    kcuda_paged_attn<<<grid, D, shmem,stream>>>(q, out, k_pool, v_pool, block_table_dev, q_pos_base,
+                                     Hq, Hkv, D, BLOCK, scale,stream);
 }
 
 // ---------- argmax ----------
-__global__ void k_argmax(const float* x, int n, int* out_idx) {
+__global__ void k_argmax(const float* x, int n, int* out_idx,cudaStream_t stream) {
     __shared__ float vbest[256];
     __shared__ int   ibest[256];
     float vb = -FLT_MAX; int ib = 0;
@@ -161,8 +242,8 @@ __global__ void k_argmax(const float* x, int n, int* out_idx) {
     }
     if (threadIdx.x == 0) *out_idx = ibest[0];
 }
-void qk_argmax(const float* logits, int n, int* d_idx) {
-    k_argmax<<<1, 256>>>(logits, n, d_idx);
+void qk_argmax(const float* logits, int n, int* d_idx,cudaStream_t stream) {
+    k_argmax<<<1, 256,0,stream>>>(logits, n, d_idx,stream);
 }
 
 // ===================== 里程碑2 批量 kernel =====================
@@ -189,6 +270,8 @@ __global__ void k_batched_write_kv(const float* k, const float* v, float* k_pool
                                    const int* table_all, const int* tab_off, const int* wpos,
                                    int Hkv, int D, int BLOCK) {
     int blk = blockIdx.x;            // = r*Hkv + hk
+    //这里blockIdx.x = r*Hkv + hk 纯个人喜好，也可以blockIdx.x = r,blockIdx.y = hk
+    //不过下面CPU主机端调用函数时，需要dim grid(L,Hkv),k_batched_write_kv<<<grid,D>>>
     int r = blk / Hkv, hk = blk % Hkv;
     const int* table = table_all + tab_off[r];
     int pos = wpos[r];

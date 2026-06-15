@@ -63,11 +63,12 @@ int main(int argc, char** argv) {
     float *k_pool = dmalloc(NL * layer_stride), *v_pool = dmalloc(NL * layer_stride);
     // 恒等 block_table
     std::vector<int> bt(blocks_pl); for (int i = 0; i < blocks_pl; ++i) bt[i] = i;
-    int *d_bt; cudaMalloc(&d_bt, blocks_pl*sizeof(int));
+    int *d_bt; cudaMalloc(&d_bt, blocks_pl*sizeof(int));//指针d_bt分配在主机CPU上，通过cudaMalloc分配GPU显存，指向GPU的地址
     cudaMemcpy(d_bt, bt.data(), blocks_pl*sizeof(int), cudaMemcpyHostToDevice);
 
     // 一段前向：x[M,H] 在位置 [pos_base, pos_base+M)，写 KV、跑 attention，返回最后一行的 argmax。
     auto forward = [&](float* xbuf, int M, int pos_base) -> int {
+        //TODO CUDA graph
         for (int l = 0; l < NL; ++l) {
             float* kp = k_pool + (size_t)l * layer_stride;
             float* vp = v_pool + (size_t)l * layer_stride;
@@ -99,7 +100,6 @@ int main(int argc, char** argv) {
         int next; cudaMemcpy(&next, d_idx, sizeof(int), cudaMemcpyDeviceToHost);
         return next;
     };
-
     // ---- prefill ----
     cudaMemcpy(d_ids, prompt.data(), P*sizeof(int), cudaMemcpyHostToDevice);
     qk_embed_gather(x, w.ptr("model.embed_tokens.weight"), d_ids, P, H);
@@ -107,15 +107,79 @@ int main(int argc, char** argv) {
     int next = forward(x, P, 0);
     gen.push_back(next);
 
-    // ---- decode：逐 token，单行前向，pos = P + (k-1) ----
+    // ---- decode：逐 token，单行前向，pos = P + (k-1) ---- 
+    //CUDA graph begin
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    int* d_posbase,*d_tokenid;
+    cudaMalloc(&d_posbase,sizeof(int));
+    cudaMalloc(&d_tokenid,sizeof(int));
     float* x1 = x;   // 复用首行
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graphExec = nullptr;
+    cublasSetStream(g_cublas, stream);
+    cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal);
+    qk_embed_gather(x1, w.ptr("model.embed_tokens.weight"), d_tokenid, 1, H,stream);
+    for (int l = 0; l < NL; ++l) {
+        float* kp = k_pool + (size_t)l * layer_stride;
+        float* vp = v_pool + (size_t)l * layer_stride;
+        qk_rmsnorm(nrm, x1, w.lp(l, "input_layernorm.weight"), 1, H, EPS,stream);
+        linear(Q, nrm, w.lp(l, "self_attn.q_proj.weight"), 1, Hq*D, H);
+        qk_add_bias(Q, w.lp(l, "self_attn.q_proj.bias"), 1, Hq*D,stream);
+        linear(K, nrm, w.lp(l, "self_attn.k_proj.weight"), 1, Hkv*D, H);
+        qk_add_bias(K, w.lp(l, "self_attn.k_proj.bias"), 1, Hkv*D,stream);
+        linear(V, nrm, w.lp(l, "self_attn.v_proj.weight"), 1, Hkv*D, H);
+        qk_add_bias(V, w.lp(l, "self_attn.v_proj.bias"), 1, Hkv*D,stream);
+        qkcuda_rope(Q, 1, Hq, D, d_posbase, THETA,stream);
+        qkcuda_rope(K, 1, Hkv, D, d_posbase, THETA,stream);
+        qkcuda_write_kv(K, V, kp, vp, d_bt, d_posbase, 1, Hkv, D, BLOCK,stream);
+        qkcuda_paged_causal_attn(Q, att, kp, vp, d_bt, d_posbase, 1, Hq, Hkv, D, BLOCK, scale,stream);
+        linear(oo, att, w.lp(l, "self_attn.o_proj.weight"), 1, H, Hq*D);  // 无 bias
+        qk_add_residual(x1, oo, 1*H,stream);
+        qk_rmsnorm(nrm, x1, w.lp(l, "post_attention_layernorm.weight"), 1, H, EPS,stream);
+        linear(gate, nrm, w.lp(l, "mlp.gate_proj.weight"), 1, IM, H);
+        linear(up,   nrm, w.lp(l, "mlp.up_proj.weight"),   1, IM, H);
+        qk_silu_mul(gate, gate, up, 1*IM,stream);
+        linear(down, gate, w.lp(l, "mlp.down_proj.weight"), 1, H, IM);
+        qk_add_residual(x1, down, 1*H,stream);
+    }
+    // 末位 token -> final norm -> logits -> argmax
+    float* xlast = x1 + (size_t)(1-1)*H;
+    qk_rmsnorm(nrm, xlast, w.ptr("model.norm.weight"), 1, H, EPS,stream);
+    linear(logits, nrm, w.ptr("lm_head.weight"), 1, VOCAB, H);
+    qk_argmax(logits, VOCAB, d_idx,stream);
+    cudaError_t err;
+    err = cudaStreamEndCapture(stream, &graph);
+    if(err!=cudaSuccess){
+        fprintf(stderr,"Capture err: %s\n",cudaGetErrorString(err));
+        exit(0);
+    }
+    if(graph!=nullptr){
+        err = cudaGraphInstantiate(&graphExec, graph, NULL, NULL, 0);
+        if(err!=cudaSuccess){
+            fprintf(stderr,"Instantiate err: %s\n",cudaGetErrorString(err));
+            exit(0);
+        }
+    }else{
+        fprintf(stderr,"graph is nullptr after capture!\n");
+    }
+    
+    //CUDA graph end
     for (int k = 1; k < max_new; ++k) {
         int pos = P + k - 1;
-        cudaMemcpy(d_ids, &gen.back(), sizeof(int), cudaMemcpyHostToDevice);
-        qk_embed_gather(x1, w.ptr("model.embed_tokens.weight"), d_ids, 1, H);
-        next = forward(x1, 1, pos);
+        cudaMemcpy(d_tokenid, &gen.back(), sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_posbase,&pos,sizeof(int),cudaMemcpyHostToDevice);
+        cudaGraphLaunch(graphExec, stream);
+        cudaStreamSynchronize(stream);
+        int next;
+        cudaMemcpy(&next,d_idx,sizeof(int),cudaMemcpyDeviceToHost);
         gen.push_back(next);
     }
+    cudaGraphExecDestroy(graphExec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    cudaFree(d_posbase);
+    cudaFree(d_tokenid);
 
     // 输出生成的 token id
     for (size_t i = 0; i < gen.size(); ++i) printf("%d%c", gen[i], i+1<gen.size()?' ':'\n');

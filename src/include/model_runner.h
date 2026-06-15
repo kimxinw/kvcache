@@ -2,7 +2,7 @@
 // model_runner.h —— GPU 执行器: 对一个 running batch 真跑【一步 paged decode】。
 //
 // 取代旧 scheduler.h 里那个也叫 Engine、却把「KV 物理池 + 执行 + 计时」混在一起的结构体。
-// 现在职责清爽:
+// 现在职责:
 //   - KV 物理池      -> KVCacheManager 拥有 (传引用进来用)
 //   - 每步暂存(q/out + gather 三件套 table/off/len) + cudaEvent 计时 -> ModelRunner 自持
 //   - 块分配 / block_table 维护 -> KVCacheManager

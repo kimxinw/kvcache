@@ -49,7 +49,7 @@ inline EngineStats run_static(std::vector<Request> reqs, KVCacheManager& kvm,
         return blocks_needed(s.prompt_len + s.max_new_tokens, kvm.block_size);
     };
 
-    std::vector<double> lat;
+    std::vector<double> lat;//FP64
     size_t idx = 0; double clock = 0;
 
     while (idx < seqs.size()) {
