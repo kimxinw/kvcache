@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
 
     // ---- 批量 decode 一步：对所有 running 序列各推进 1 token ----
     auto decode_step = [&](std::vector<Seq*>& run) {
-        int N = (int)run.size();
+        int N = (int)run.size();//batch size
         std::vector<int> h_ids(N), h_tab, h_off(N+1), h_pos(N), h_len(N);
         for (int r = 0; r < N; ++r) {
             Seq* s = run[r];

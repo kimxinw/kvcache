@@ -14,6 +14,8 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <chrono>
+#include <algorithm>
 
 // ---- Qwen2.5-0.5B-Instruct 结构常量 ----
 static const int H = 896, Hq = 14, Hkv = 2, D = 64, IM = 4864, NL = 24;
@@ -21,6 +23,18 @@ static const int VOCAB = 151936, BLOCK = 16;
 static const float EPS = 1e-6f, THETA = 1000000.0f;
 
 static cublasHandle_t g_cublas;
+
+// decode 稳态计时汇报：丢弃 warmup 步后，对 per-token 墙钟取中位数。
+// 输出走 stderr（stdout 只留 token id 行，diff_cudagraph.py 仍能解析）。
+static void report_decode_timing(std::vector<double>& us, const char* tag) {
+    if (us.empty()) { fprintf(stderr, "[bench] %s: no timed steps\n", tag); return; }
+    std::sort(us.begin(), us.end());
+    double med = us[us.size() / 2];
+    double sum = 0; for (double v : us) sum += v;
+    double mean = sum / us.size();
+    fprintf(stderr, "[bench] %s steps=%zu median=%.1f us/tok mean=%.1f us/tok %.1f tok/s\n",
+            tag, us.size(), med, mean, 1e6 / med);
+}
 
 // y[M,N] = x[M,K] @ W[N,K]^T   (W 是 PyTorch [out=N, in=K] row-major)
 static void linear(float* y, const float* x, const float* W, int M, int N, int K) {
@@ -106,7 +120,7 @@ int main(int argc, char** argv) {
     std::vector<int> gen;
     int next = forward(x, P, 0);
     gen.push_back(next);
-
+#ifdef CUDAG
     // ---- decode：逐 token，单行前向，pos = P + (k-1) ---- 
     //CUDA graph begin
     cudaStream_t stream;
@@ -165,22 +179,45 @@ int main(int argc, char** argv) {
     }
     
     //CUDA graph end
+    const int WARMUP = std::min(16, max_new / 4);   // 丢掉 graph 首次 replay / 升频 / workspace 首分配
+    std::vector<double> step_us;
     for (int k = 1; k < max_new; ++k) {
         int pos = P + k - 1;
+        auto t0 = std::chrono::steady_clock::now();
         cudaMemcpy(d_tokenid, &gen.back(), sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(d_posbase,&pos,sizeof(int),cudaMemcpyHostToDevice);
         cudaGraphLaunch(graphExec, stream);
         cudaStreamSynchronize(stream);
         int next;
         cudaMemcpy(&next,d_idx,sizeof(int),cudaMemcpyDeviceToHost);
+        auto t1 = std::chrono::steady_clock::now();
         gen.push_back(next);
+        if (k > WARMUP) step_us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
     }
+    report_decode_timing(step_us, "graph");
     cudaGraphExecDestroy(graphExec);
     cudaGraphDestroy(graph);
     cudaStreamDestroy(stream);
     cudaFree(d_posbase);
     cudaFree(d_tokenid);
+#else 
+    // ---- decode：逐 token，单行前向，pos = P + (k-1) ----
+    float* x1 = x;   // 复用首行
+    const int WARMUP = std::min(16, max_new / 4);   // 与 graph 路径对齐
+    std::vector<double> step_us;
+    for (int k = 1; k < max_new; ++k) {
+        int pos = P + k - 1;
+        auto t0 = std::chrono::steady_clock::now();
+        cudaMemcpy(d_ids, &gen.back(), sizeof(int), cudaMemcpyHostToDevice);
+        qk_embed_gather(x1, w.ptr("model.embed_tokens.weight"), d_ids, 1, H);
+        next = forward(x1, 1, pos);   // forward 末尾 D2H 隐式 sync，墙钟即真实 per-token 延迟
+        auto t1 = std::chrono::steady_clock::now();
+        gen.push_back(next);
+        if (k > WARMUP) step_us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+    }
+    report_decode_timing(step_us, "eager");
 
+#endif
     // 输出生成的 token id
     for (size_t i = 0; i < gen.size(); ++i) printf("%d%c", gen[i], i+1<gen.size()?' ':'\n');
     cudaDeviceSynchronize();

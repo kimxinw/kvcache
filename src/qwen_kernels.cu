@@ -293,6 +293,7 @@ __global__ void k_batched_paged_decode_attn(const float* q, float* out,
                                             const float* k_pool, const float* v_pool,
                                             const int* table_all, const int* tab_off, const int* cur_len,
                                             int Hq, int Hkv, int D, int BLOCK, float scale) {
+    //该kernels函数分配了N*Hq个block，每个block有D个线程进行并行计算
     int s = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     int kv_head = h / (Hq / Hkv);
     int L = cur_len[s];
