@@ -110,3 +110,43 @@ python ref/plot.py                                # 出图到 data/*.png
 - continuous 的 `avg_batch` 只有 5.5、峰值块 269（来一个处理一个、不囤积）；static 攒到 20.6 宽才开跑、囤 665 块。
 
 **结论**：输出长度方差越大、在线负载越实时，static 整批等待的浪费越严重。continuous batching（iteration-level scheduling）把空转 slot 用排队中的新请求填满——离线提吞吐、在线降延迟，这是 vLLM 在 paged attention 之上把服务能力再翻倍的第二个关键。
+
+---
+
+## ⑤ 真模型 Qwen2.5-0.5B：fp16 推理
+
+把上面的手写 kernel 接到真模型（Qwen2.5-0.5B-Instruct）的端到端前向 + 贪心 decode：线性层（QKV/O/MLP/lm_head）走 cuBLAS，embed / RMSNorm / RoPE / SwiGLU / 写KV / GQA 因果分页 attention 走手写 kernel。两个可执行：`qwen_infer`（单序列，含 CUDA graph decode）与 `qwen_serve`（continuous batching 多序列）。
+
+| 文件 | 作用 |
+|------|------|
+| `tools/dump_weights.py` | 把 HF 权重以 **fp16** 铺进 `weights.bin` + 生成 `manifest.tsv` |
+| `src/include/qwen_loader.h` | 整块上传权重，按字节偏移定位每个 tensor（`half*`） |
+| `src/qwen_kernels.cu` | 真模型用的手写 kernel（half I/O，内部 fp32 累加） |
+| `apps/qwen_infer.cu` | 单序列前向 + 贪心 decode；`-DCUDAG` 编出 CUDA graph 版 |
+| `apps/qwen_serve.cu` | continuous batching 多序列真生成 |
+
+### fp16 迁移
+
+decode 是**显存带宽瓶颈**（每生成 1 个 token 都要把全部权重过一遍），故把权重 / 激活 / KV 池全程改 **fp16（half）** 存储：
+
+- **权重**：`weights.bin` 从 fp32 的 **2520 MB → fp16 1260 MB**（带宽减半）。
+- **GEMM**：`cublasSgemm` → `cublasGemmEx`（A/B = `CUDA_R_16F`，compute = `CUBLAS_COMPUTE_32F`，即 **fp32 累加**）。
+- **kernel**：I/O 全 `half`，内部一律 fp32 累加（RMSNorm 平方和、attention 在线 softmax 尤其不能用 fp16 累加）。
+- **logits**：lm_head 单独走 fp32 输出（`CUDA_R_32F`）直接给 argmax，避开 151936 大词表上的 fp16 精度损失。
+
+```bash
+python tools/dump_weights.py        # 导出 fp16 weights.bin + manifest.tsv（需本地已缓存 HF 权重）
+python tools/diff_cudagraph.py      # graph vs eager 生成 token 逐位对拍
+python tools/bench_cudagraph.py     # fp16 decode 性能（eager vs graph）
+```
+
+### 结果（batch=1，prompt_len=29，max_new=256）
+
+| 路径 | fp32 µs/tok | fp16 µs/tok | 提升 |
+|--|--:|--:|--:|
+| eager | 11196 | 8735 | **1.28×** |
+| graph | 10737 | 8104 | **1.32×** |
+
+- **正确性**：`diff_cudagraph.py` 4 个 prompt 下，graph 与 eager 生成的 token 序列逐位一致。
+- **为什么是 ~1.3× 而非理论 2×**：fp16 只省**权重 GEMM** 的显存带宽；而长上下文 decode 里 attention kernel 是 O(L) 且含大量 `__syncthreads` 树形规约的**同步瓶颈**（不是带宽瓶颈），占比随上下文增大，把 GEMM 的 2× 收益稀释。极短上下文（几乎纯 GEMM）下可见 ~2.2×。**下一个瓶颈即此 attention kernel**（可用 warp shuffle 规约替掉 shared-mem 多次同步）。
+- CUDA graph 相对 eager 的收益从 fp32 的 1.04× 微升到 fp16 的 1.08×：kernel 变短后 launch 开销占比略升，但长上下文下仍大半被长 kernel 掩盖。

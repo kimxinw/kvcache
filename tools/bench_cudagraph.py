@@ -6,6 +6,8 @@
 #   两个 binary 各自在稳态(丢 warmup)打印 [bench] 计时行，本脚本解析并对比。
 #   用法：python tools/bench_cudagraph.py
 import os, re, sys, subprocess
+os.environ.setdefault("HF_HUB_OFFLINE", "1")        # 必须在 import transformers 之前：
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")  #   huggingface_hub 在 import 时即读取并缓存该值
 from transformers import AutoTokenizer
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -13,8 +15,6 @@ HERE  = os.path.dirname(os.path.abspath(__file__))
 DIR   = os.path.join(HERE, "..", "data", "qwen05b")
 BIN_G = os.path.join(HERE, "..", "build", "qwen_infer")        # graph 版
 BIN_E = os.path.join(HERE, "..", "build", "qwen_infer_eager")  # eager 基线
-os.environ.setdefault("HF_HUB_OFFLINE", "1")        # 强制离线
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 tok = AutoTokenizer.from_pretrained(MODEL)
 
 PROMPT  = "Give me a short introduction to large language models."

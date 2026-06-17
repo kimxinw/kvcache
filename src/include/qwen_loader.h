@@ -1,8 +1,9 @@
 #pragma once
-// qwen_loader.h —— 读 manifest.tsv + weights.bin，把整块 fp32 权重一次性传上 GPU。
-//   每个 tensor 的设备指针 = d_base + offset_bytes/4。按 HF 原名查询。
-//   (embed 与 lm_head 因 tie 重复存了一份，整块 2.5GB，3060 12G 放得下。)
+// qwen_loader.h —— 读 manifest.tsv + weights.bin，把整块 fp16 权重一次性传上 GPU。
+//   每个 tensor 的设备指针 = (char*)d_base + offset_bytes。按 HF 原名查询。
+//   (embed 与 lm_head 因 tie 重复存了一份，fp16 整块 ~1.26GB，3060 12G 放得下。)
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,10 +18,10 @@
     printf("CUDA err %s @%s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); exit(1);} }while(0)
 #endif
 
-struct Tensor { size_t off_floats; std::vector<int> shape; };
+struct Tensor { size_t off_bytes; std::vector<int> shape; };
 
 struct QwenWeights {
-    float* d_base = nullptr;                 // 整块权重 (设备)
+    half* d_base = nullptr;                 // 整块权重 (设备)
     std::unordered_map<std::string, Tensor> tmap;
 
     void load(const std::string& dir) {
@@ -38,7 +39,7 @@ struct QwenWeights {
             std::getline(ss, name, '\t');
             ss >> off; ss.ignore(1); ss >> nb; ss.ignore(1);
             std::getline(ss, shape_csv);
-            Tensor t; t.off_floats = off / 4;
+            Tensor t; t.off_bytes = off;
             std::stringstream sc(shape_csv); std::string d;
             while (std::getline(sc, d, ',')) if (!d.empty()) t.shape.push_back(std::stoi(d));
             tmap[name] = t;
@@ -52,7 +53,7 @@ struct QwenWeights {
         bf.seekg(0);
         std::vector<char> host(bytes);
         bf.read(host.data(), bytes);
-        QW_CK(cudaMalloc(&d_base, bytes));
+        QW_CK(cudaMalloc((void**)&d_base, bytes));
         QW_CK(cudaMemcpy(d_base, host.data(), bytes, cudaMemcpyHostToDevice));
         printf("[loader] uploaded %.1f MB, %zu tensors\n", bytes/1e6, tmap.size());
     }
@@ -62,9 +63,12 @@ struct QwenWeights {
         if (it == tmap.end()) { printf("missing tensor %s\n", name.c_str()); exit(1); }
         return it->second;
     }
-    float* ptr(const std::string& name) const { return d_base + info(name).off_floats; }
+    // off_bytes 是字节偏移；用 char* 推进再转回 half*，不依赖元素大小。
+    half* ptr(const std::string& name) const {
+        return reinterpret_cast<half*>(reinterpret_cast<char*>(d_base) + info(name).off_bytes);
+    }
     // 便捷：层 ℓ 的某权重
-    float* lp(int l, const char* suffix) const {
+    half* lp(int l, const char* suffix) const {
         char buf[128]; snprintf(buf, sizeof(buf), "model.layers.%d.%s", l, suffix);
         return ptr(buf);
     }

@@ -10,6 +10,7 @@
 #include "qwen_loader.h"
 #include "qwen_kernels.h"
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <vector>
 #include <string>
@@ -37,11 +38,22 @@ static void report_decode_timing(std::vector<double>& us, const char* tag) {
 }
 
 // y[M,N] = x[M,K] @ W[N,K]^T   (W 是 PyTorch [out=N, in=K] row-major)
-static void linear(float* y, const float* x, const float* W, int M, int N, int K) {
+//   fp16 输入/输出，fp32 累加 (compute=CUBLAS_COMPUTE_32F)。alpha/beta 按 compute type 用 float。
+//   转置约定不变：把 row-major 当 col-major，等价 gemm(T,N, N,M,K)。
+static void linear(half* y, const half* x, const half* W, int M, int N, int K) {
     const float one = 1.f, zero = 0.f;
-    // 把 row-major 数据当 col-major：见推导，等价 sgemm(T,N, N,M,K)。
-    cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
-                &one, W, K, x, K, &zero, y, N);
+    cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+                 &one, W, CUDA_R_16F, K, x, CUDA_R_16F, K,
+                 &zero, y, CUDA_R_16F, N,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+// lm_head 专用：fp16 输入，fp32 输出 (logits 直接给 argmax，避免 fp16 在 151936 类上丢精度)。
+static void linear_logits(float* y, const half* x, const half* W, int M, int N, int K) {
+    const float one = 1.f, zero = 0.f;
+    cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+                 &one, W, CUDA_R_16F, K, x, CUDA_R_16F, K,
+                 &zero, y, CUDA_R_32F, N,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
 int main(int argc, char** argv) {
@@ -64,28 +76,28 @@ int main(int argc, char** argv) {
     float scale = 1.f / sqrtf((float)D);
 
     // ---- 设备缓冲 ----
-    auto dmalloc = [](size_t n){ float* p; cudaMalloc(&p, n*sizeof(float)); return p; };
-    float *x = dmalloc((size_t)Lmax*H), *nrm = dmalloc((size_t)Lmax*H);
-    float *Q = dmalloc((size_t)Lmax*Hq*D), *K = dmalloc((size_t)Lmax*Hkv*D), *V = dmalloc((size_t)Lmax*Hkv*D);
-    float *att = dmalloc((size_t)Lmax*Hq*D), *oo = dmalloc((size_t)Lmax*H);
-    float *gate = dmalloc((size_t)Lmax*IM), *up = dmalloc((size_t)Lmax*IM), *down = dmalloc((size_t)Lmax*H);
-    float *logits = dmalloc(VOCAB);
+    auto dmalloc = [](size_t n){ half* p; cudaMalloc(&p, n*sizeof(half)); return p; };
+    half *x = dmalloc((size_t)Lmax*H), *nrm = dmalloc((size_t)Lmax*H);
+    half *Q = dmalloc((size_t)Lmax*Hq*D), *K = dmalloc((size_t)Lmax*Hkv*D), *V = dmalloc((size_t)Lmax*Hkv*D);
+    half *att = dmalloc((size_t)Lmax*Hq*D), *oo = dmalloc((size_t)Lmax*H);
+    half *gate = dmalloc((size_t)Lmax*IM), *up = dmalloc((size_t)Lmax*IM), *down = dmalloc((size_t)Lmax*H);
+    float *logits; cudaMalloc(&logits, VOCAB*sizeof(float));   // lm_head 输出 fp32
     int *d_ids; cudaMalloc(&d_ids, (size_t)Lmax*sizeof(int));
     int *d_idx; cudaMalloc(&d_idx, sizeof(int));
     // 每层 KV 池基址 = l * (blocks_pl*Hkv*BLOCK*D)
     size_t layer_stride = (size_t)blocks_pl * Hkv * BLOCK * D;
-    float *k_pool = dmalloc(NL * layer_stride), *v_pool = dmalloc(NL * layer_stride);
+    half *k_pool = dmalloc(NL * layer_stride), *v_pool = dmalloc(NL * layer_stride);
     // 恒等 block_table
     std::vector<int> bt(blocks_pl); for (int i = 0; i < blocks_pl; ++i) bt[i] = i;
     int *d_bt; cudaMalloc(&d_bt, blocks_pl*sizeof(int));//指针d_bt分配在主机CPU上，通过cudaMalloc分配GPU显存，指向GPU的地址
     cudaMemcpy(d_bt, bt.data(), blocks_pl*sizeof(int), cudaMemcpyHostToDevice);
 
     // 一段前向：x[M,H] 在位置 [pos_base, pos_base+M)，写 KV、跑 attention，返回最后一行的 argmax。
-    auto forward = [&](float* xbuf, int M, int pos_base) -> int {
+    auto forward = [&](half* xbuf, int M, int pos_base) -> int {
         //TODO CUDA graph
         for (int l = 0; l < NL; ++l) {
-            float* kp = k_pool + (size_t)l * layer_stride;
-            float* vp = v_pool + (size_t)l * layer_stride;
+            half* kp = k_pool + (size_t)l * layer_stride;
+            half* vp = v_pool + (size_t)l * layer_stride;
             qk_rmsnorm(nrm, xbuf, w.lp(l, "input_layernorm.weight"), M, H, EPS);
             linear(Q, nrm, w.lp(l, "self_attn.q_proj.weight"), M, Hq*D, H);
             qk_add_bias(Q, w.lp(l, "self_attn.q_proj.bias"), M, Hq*D);
@@ -107,9 +119,9 @@ int main(int argc, char** argv) {
             qk_add_residual(xbuf, down, M*H);
         }
         // 末位 token -> final norm -> logits -> argmax
-        float* xlast = xbuf + (size_t)(M-1)*H;
+        half* xlast = xbuf + (size_t)(M-1)*H;
         qk_rmsnorm(nrm, xlast, w.ptr("model.norm.weight"), 1, H, EPS);
-        linear(logits, nrm, w.ptr("lm_head.weight"), 1, VOCAB, H);
+        linear_logits(logits, nrm, w.ptr("lm_head.weight"), 1, VOCAB, H);
         qk_argmax(logits, VOCAB, d_idx);
         int next; cudaMemcpy(&next, d_idx, sizeof(int), cudaMemcpyDeviceToHost);
         return next;
@@ -128,15 +140,15 @@ int main(int argc, char** argv) {
     int* d_posbase,*d_tokenid;
     cudaMalloc(&d_posbase,sizeof(int));
     cudaMalloc(&d_tokenid,sizeof(int));
-    float* x1 = x;   // 复用首行
+    half* x1 = x;   // 复用首行
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graphExec = nullptr;
     cublasSetStream(g_cublas, stream);
     cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal);
     qk_embed_gather(x1, w.ptr("model.embed_tokens.weight"), d_tokenid, 1, H,stream);
     for (int l = 0; l < NL; ++l) {
-        float* kp = k_pool + (size_t)l * layer_stride;
-        float* vp = v_pool + (size_t)l * layer_stride;
+        half* kp = k_pool + (size_t)l * layer_stride;
+        half* vp = v_pool + (size_t)l * layer_stride;
         qk_rmsnorm(nrm, x1, w.lp(l, "input_layernorm.weight"), 1, H, EPS,stream);
         linear(Q, nrm, w.lp(l, "self_attn.q_proj.weight"), 1, Hq*D, H);
         qk_add_bias(Q, w.lp(l, "self_attn.q_proj.bias"), 1, Hq*D,stream);
@@ -158,9 +170,9 @@ int main(int argc, char** argv) {
         qk_add_residual(x1, down, 1*H,stream);
     }
     // 末位 token -> final norm -> logits -> argmax
-    float* xlast = x1 + (size_t)(1-1)*H;
+    half* xlast = x1 + (size_t)(1-1)*H;
     qk_rmsnorm(nrm, xlast, w.ptr("model.norm.weight"), 1, H, EPS,stream);
-    linear(logits, nrm, w.ptr("lm_head.weight"), 1, VOCAB, H);
+    linear_logits(logits, nrm, w.ptr("lm_head.weight"), 1, VOCAB, H);
     qk_argmax(logits, VOCAB, d_idx,stream);
     cudaError_t err;
     err = cudaStreamEndCapture(stream, &graph);
@@ -202,7 +214,7 @@ int main(int argc, char** argv) {
     cudaFree(d_tokenid);
 #else 
     // ---- decode：逐 token，单行前向，pos = P + (k-1) ----
-    float* x1 = x;   // 复用首行
+    half* x1 = x;   // 复用首行
     const int WARMUP = std::min(16, max_new / 4);   // 与 graph 路径对齐
     std::vector<double> step_us;
     for (int k = 1; k < max_new; ++k) {

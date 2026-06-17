@@ -5,6 +5,8 @@
 #   decode 是纯 argmax 贪心、确定性 → 任何分叉 = graph 路径有 bug。
 #   用法：python tools/diff_cudagraph.py        (退出码 0=全过, 1=有分叉)
 import os, sys, subprocess
+os.environ.setdefault("HF_HUB_OFFLINE", "1")        # 必须在 import transformers 之前：
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")  #   huggingface_hub 在 import 时即读取并缓存该值
 from transformers import AutoTokenizer
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -12,8 +14,6 @@ HERE  = os.path.dirname(os.path.abspath(__file__))
 DIR   = os.path.join(HERE, "..", "data", "qwen05b")
 BIN_G = os.path.join(HERE, "..", "build", "qwen_infer")        # graph 版
 BIN_E = os.path.join(HERE, "..", "build", "qwen_infer_eager")  # eager 基线
-os.environ.setdefault("HF_HUB_OFFLINE", "1")        # 强制离线
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")  # 否则新版 transformers 仍会联网拉 chat template
 tok = AutoTokenizer.from_pretrained(MODEL)
 
 # (prompt, max_new)；max_new 取大些，多覆盖 decode/重放步，更易暴露 pos 累积错位

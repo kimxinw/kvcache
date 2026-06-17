@@ -9,6 +9,7 @@
 #include "qwen_kernels.h"
 #include "block_alloc.h"
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <vector>
 #include <string>
@@ -22,9 +23,19 @@ static const float EPS = 1e-6f, THETA = 1000000.0f;
 static const int EOS_A = 151645, EOS_B = 151643;
 
 static cublasHandle_t g_cublas;
-static void linear(float* y, const float* x, const float* W, int M, int N, int K) {
+// fp16 输入/输出，fp32 累加。转置约定不变(row-major 当 col-major)。
+static void linear(half* y, const half* x, const half* W, int M, int N, int K) {
     const float one = 1.f, zero = 0.f;
-    cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &one, W, K, x, K, &zero, y, N);
+    cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+                 &one, W, CUDA_R_16F, K, x, CUDA_R_16F, K,
+                 &zero, y, CUDA_R_16F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+// lm_head 专用：fp16 输入，fp32 输出 logits 给 argmax。
+static void linear_logits(float* y, const half* x, const half* W, int M, int N, int K) {
+    const float one = 1.f, zero = 0.f;
+    cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+                 &one, W, CUDA_R_16F, K, x, CUDA_R_16F, K,
+                 &zero, y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
 struct Seq {
@@ -58,12 +69,12 @@ int main(int argc, char** argv) {
     // ---- 设备缓冲（按最大行数 = max(prompt_len, MAXB)）----
     int maxP = MAXB; for (auto& s : store) maxP = std::max(maxP, s.prompt_len);
     int MR = maxP;
-    auto dm = [](size_t n){ float* p; cudaMalloc(&p, n*sizeof(float)); return p; };
-    float *x=dm((size_t)MR*H), *nrm=dm((size_t)MR*H);
-    float *Q=dm((size_t)MR*Hq*D), *K=dm((size_t)MR*Hkv*D), *V=dm((size_t)MR*Hkv*D);
-    float *att=dm((size_t)MR*Hq*D), *oo=dm((size_t)MR*H);
-    float *gate=dm((size_t)MR*IM), *up=dm((size_t)MR*IM), *down=dm((size_t)MR*H);
-    float *logits=dm((size_t)MAXB*VOCAB);
+    auto dm = [](size_t n){ half* p; cudaMalloc(&p, n*sizeof(half)); return p; };
+    half *x=dm((size_t)MR*H), *nrm=dm((size_t)MR*H);
+    half *Q=dm((size_t)MR*Hq*D), *K=dm((size_t)MR*Hkv*D), *V=dm((size_t)MR*Hkv*D);
+    half *att=dm((size_t)MR*Hq*D), *oo=dm((size_t)MR*H);
+    half *gate=dm((size_t)MR*IM), *up=dm((size_t)MR*IM), *down=dm((size_t)MR*H);
+    float *logits; cudaMalloc(&logits, (size_t)MAXB*VOCAB*sizeof(float));   // lm_head 输出 fp32
     int *d_ids; cudaMalloc(&d_ids, (size_t)MR*sizeof(int));
     int *d_idx; cudaMalloc(&d_idx, MAXB*sizeof(int));
     int *d_tab; cudaMalloc(&d_tab, NUM_BLOCKS*sizeof(int));
@@ -72,7 +83,7 @@ int main(int argc, char** argv) {
     int *d_len; cudaMalloc(&d_len, MAXB*sizeof(int));
 
     size_t layer_stride = (size_t)NUM_BLOCKS * Hkv * BLOCK * D;
-    float *k_pool=dm(NL*layer_stride), *v_pool=dm(NL*layer_stride);
+    half *k_pool=dm(NL*layer_stride), *v_pool=dm(NL*layer_stride);
     BlockAllocator alloc(NUM_BLOCKS);
 
     // ---- 单序列 prefill：写 KV 入池，返回首个生成 token ----
@@ -85,8 +96,8 @@ int main(int argc, char** argv) {
         cudaMemcpy(d_ids, s.tokens.data(), P*sizeof(int), cudaMemcpyHostToDevice);
         qk_embed_gather(x, w.ptr("model.embed_tokens.weight"), d_ids, P, H);
         for (int l = 0; l < NL; ++l) {
-            float* kp = k_pool + (size_t)l*layer_stride;
-            float* vp = v_pool + (size_t)l*layer_stride;
+            half* kp = k_pool + (size_t)l*layer_stride;
+            half* vp = v_pool + (size_t)l*layer_stride;
             qk_rmsnorm(nrm, x, w.lp(l,"input_layernorm.weight"), P, H, EPS);
             linear(Q, nrm, w.lp(l,"self_attn.q_proj.weight"), P, Hq*D, H); qk_add_bias(Q, w.lp(l,"self_attn.q_proj.bias"), P, Hq*D);
             linear(K, nrm, w.lp(l,"self_attn.k_proj.weight"), P, Hkv*D, H); qk_add_bias(K, w.lp(l,"self_attn.k_proj.bias"), P, Hkv*D);
@@ -105,7 +116,7 @@ int main(int argc, char** argv) {
             qk_add_residual(x, down, P*H);
         }
         qk_rmsnorm(nrm, x + (size_t)(P-1)*H, w.ptr("model.norm.weight"), 1, H, EPS);
-        linear(logits, nrm, w.ptr("lm_head.weight"), 1, VOCAB, H);
+        linear_logits(logits, nrm, w.ptr("lm_head.weight"), 1, VOCAB, H);
         qk_argmax(logits, VOCAB, d_idx);
         int t; cudaMemcpy(&t, d_idx, sizeof(int), cudaMemcpyDeviceToHost);
         s.cur_len = P; s.tokens.push_back(t);
@@ -137,8 +148,8 @@ int main(int argc, char** argv) {
 
         qk_embed_gather(x, w.ptr("model.embed_tokens.weight"), d_ids, N, H);
         for (int l = 0; l < NL; ++l) {
-            float* kp = k_pool + (size_t)l*layer_stride;
-            float* vp = v_pool + (size_t)l*layer_stride;
+            half* kp = k_pool + (size_t)l*layer_stride;
+            half* vp = v_pool + (size_t)l*layer_stride;
             qk_rmsnorm(nrm, x, w.lp(l,"input_layernorm.weight"), N, H, EPS);
             linear(Q, nrm, w.lp(l,"self_attn.q_proj.weight"), N, Hq*D, H); qk_add_bias(Q, w.lp(l,"self_attn.q_proj.bias"), N, Hq*D);
             linear(K, nrm, w.lp(l,"self_attn.k_proj.weight"), N, Hkv*D, H); qk_add_bias(K, w.lp(l,"self_attn.k_proj.bias"), N, Hkv*D);
@@ -157,7 +168,7 @@ int main(int argc, char** argv) {
             qk_add_residual(x, down, N*H);
         }
         qk_rmsnorm(nrm, x, w.ptr("model.norm.weight"), N, H, EPS);    // 全 N 行 final norm
-        linear(logits, nrm, w.ptr("lm_head.weight"), N, VOCAB, H);
+        linear_logits(logits, nrm, w.ptr("lm_head.weight"), N, VOCAB, H);
         for (int r = 0; r < N; ++r) qk_argmax(logits + (size_t)r*VOCAB, VOCAB, d_idx + r);
         std::vector<int> nxt(N); cudaMemcpy(nxt.data(), d_idx, N*sizeof(int), cudaMemcpyDeviceToHost);
         for (int r = 0; r < N; ++r) run[r]->tokens.push_back(nxt[r]);

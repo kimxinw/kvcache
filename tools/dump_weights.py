@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-# dump_weights.py —— 把 Qwen2.5-0.5B-Instruct 的权重以 fp32、row-major 顺序铺进
+# dump_weights.py —— 把 Qwen2.5-0.5B-Instruct 的权重以 fp16、row-major 顺序铺进
 #   一个扁平 weights.bin，并生成 manifest.json(name/shape/offset_bytes/nbytes)。
 # C++ 引擎按 name 查 manifest，读 blob，上传 GPU。
 #
-#   - 全程 fp32：cuBLAS sgemm 最简单，且与 fp32 HF oracle 对拍数值最干净。
+#   - 全程 fp16：cuBLAS sgemm 最简单，且与 fp16 HF oracle 对拍数值最干净。
 #   - PyTorch Linear.weight 形状是 [out, in]，y = x @ W^T (+b)。这里原样存 [out,in]
 #     row-major，转置约定留给 C++ 的 linear 帮手处理。
 import os, json
@@ -15,8 +15,8 @@ MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "qwen05b")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-print("loading model (fp32, cpu)...", flush=True)
-model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float32)
+print("loading model (fp16, cpu)...", flush=True)
+model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float16)
 model.eval()
 sd = model.state_dict()
 
@@ -26,12 +26,12 @@ if "lm_head.weight" not in sd:
     sd["lm_head.weight"] = sd["model.embed_tokens.weight"]
 
 bin_path = os.path.join(OUT_DIR, "weights.bin")
-manifest = {"model": MODEL, "dtype": "float32", "tensors": []}
+manifest = {"model": MODEL, "dtype": "float16", "tensors": []}
 offset = 0
 with open(bin_path, "wb") as f:
     for name, t in sd.items():
-        arr = t.detach().contiguous().to(torch.float32).numpy()
-        assert arr.dtype == np.float32
+        arr = t.detach().contiguous().to(torch.float16).numpy()
+        assert arr.dtype == np.float16
         b = arr.tobytes()
         f.write(b)
         manifest["tensors"].append({
@@ -58,6 +58,12 @@ manifest["config"] = {
 }
 with open(os.path.join(OUT_DIR, "manifest.json"), "w") as f:
     json.dump(manifest, f, indent=2)
+
+# manifest.tsv —— C++ loader 实际读的格式：name<TAB>offset<TAB>nbytes<TAB>shape_csv
+with open(os.path.join(OUT_DIR, "manifest.tsv"), "w") as f:
+    for t in manifest["tensors"]:
+        shape_csv = ",".join(str(d) for d in t["shape"])
+        f.write(f"{t['name']}\t{t['offset']}\t{t['nbytes']}\t{shape_csv}\n")
 
 print(f"wrote {bin_path} ({offset/1e6:.1f} MB), {len(manifest['tensors'])} tensors", flush=True)
 print("config:", json.dumps(manifest["config"]), flush=True)
